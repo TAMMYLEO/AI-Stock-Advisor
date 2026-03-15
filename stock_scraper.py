@@ -502,7 +502,10 @@ with tab_health:
                         2. 
                         3. 
                         """
-                        response = model.generate_content(prompt)
+                        response = model.generate_content(
+    prompt,
+    request_options={"timeout": 15.0} # 設定 15 秒強制逾時
+)
                         st.warning("⚠️ 以下為 AI 大師基於歷史紀錄的客製化診斷：")
                         st.markdown(response.text)
         except Exception as e:
