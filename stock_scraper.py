@@ -5,9 +5,7 @@ from datetime import datetime
 import plotly.graph_objects as go
 import google.generativeai as genai
 import time
-import io
 import re
-
 
 # ==========================================
 # 0. 系統說明與彈跳視窗
@@ -29,10 +27,12 @@ def show_logic_explanation():
 
     ### 5. 估值天花板偵測 (P/E & PEG)
     加入本益比 (P/E) 與本益成長比 (PEG) 指標。當 PEG > 1.5 時，代表股價可能已經透支未來成長性，接近「頂點」。
+
+    ### 6. 支援興櫃股票分析
+    系統已具備「自動盲測引擎」，您只需輸入股號，系統會自動辨識上市(.TW)或上櫃/興櫃(.TWO)。
     """)
     if st.button("了解，關閉視窗"):
         st.rerun()
-
 
 # ==========================================
 # 1. 系統常數與大師設定
@@ -47,82 +47,100 @@ strategies = {
     "價值存股派 (看重財報與逢低佈局)": teacher_chen
 }
 
-TW_STOCK_MAP = {
-    "台積電": "2330", "鴻海": "2317", "聯發科": "2454", "廣達": "2382", "緯創": "3231",
-    "華碩": "2357", "宏碁": "2353", "微星": "2377", "技嘉": "2376", "奇鋐": "3017",
-    "雙鴻": "3324", "台光電": "2383", "日月光": "3711", "聯電": "2303", "聯詠": "3034",
-    "瑞昱": "2379", "智邦": "2345", "緯穎": "6669", "大立光": "3008", "欣興": "3037",
-    "台達電": "2308", "光寶科": "2301", "研華": "2395", "川湖": "2059", "嘉澤": "3533",
-    "長榮": "2603", "陽明": "2609", "萬海": "2615", "華城": "1519", "士電": "1503",
-    "中興電": "1513", "亞力": "1514", "台泥": "1101", "亞泥": "1102", "中鋼": "2002",
-    "統一": "1216", "統一超": "2912", "和泰車": "2207", "儒鴻": "1476", "聚陽": "1477",
-    "富邦金": "2881", "國泰金": "2882", "兆豐金": "2886", "中信金": "2891", "玉山金": "2884",
-    "元大金": "2885", "第一金": "2892", "合庫金": "5880", "華南金": "2880", "開發金": "2883",
-    "台新金": "2887", "彰銀": "2801", "永豐金": "2890", "中華電": "2412", "台灣大": "3045", "遠傳": "4904",
-    "國泰永續高股息": "00878", "元大高股息": "0056", "群益台灣精選高息": "00919",
-    "元大台灣高息低波": "00713", "元大台灣50": "0050", "富邦台50": "006208",
-    "群創": "3481", "友達": "2409"
+STOCK_DB = {
+    # 常用權值股名單
+    "2330": {"name": "台積電", "market": "TW"},
+    "2317": {"name": "鴻海", "market": "TW"},
+    "2454": {"name": "聯發科", "market": "TW"},
+    "3481": {"name": "群創", "market": "TW"},
+    "7889": {"name": "騰勢", "market": "TWO"}, 
 }
-REVERSE_MAP = {v: k for k, v in TW_STOCK_MAP.items()}
 
+REVERSE_MAP = {v["name"]: k for k, v in STOCK_DB.items()}
 
-def parse_stock_input(user_input):
-    user_input = str(user_input).strip()
-    if user_input in TW_STOCK_MAP:
-        ticker = TW_STOCK_MAP[user_input]
-    else:
-        ticker = user_input.upper().replace(".TW", "").replace(".TWO", "")
-    yf_ticker = f"{ticker}.TW"
-    return ticker, yf_ticker
+def get_yf_ticker_candidates(user_input):
+    """
+    【全新雙重盲測引擎】
+    回傳候選的 yfinance 代號列表。
+    讓系統自己去撞測試，免除使用者手動輸入後綴的麻煩。
+    """
+    user_input = str(user_input).strip().upper()
+
+    # 1. 如果使用者很明確給了後綴，就只相信使用者
+    if user_input.endswith(".TW") or user_input.endswith(".TWO"):
+        return user_input.split(".")[0], [user_input]
+
+    # 2. 如果輸入中文名稱，轉換為代號
+    ticker = REVERSE_MAP.get(user_input, user_input)
+    
+    # 3. 如果在我們的資料庫有建檔，直接回傳正確的
+    if ticker in STOCK_DB:
+        return ticker, [f"{ticker}.{STOCK_DB[ticker]['market']}"]
+
+    # 4. 最強盲測：不知道是上市還上櫃？兩個都回傳，讓後續函式自己試！
+    return ticker, [f"{ticker}.TW", f"{ticker}.TWO"]
 
 
 # ==========================================
-# 2. 核心數據引擎 (含填息與估值演算)
+# 2. 核心數據引擎
 # ==========================================
 def analyze_stock(user_input, target_months, target_return, short_ma, long_ma, backtest_days):
-    ticker, yf_ticker = parse_stock_input(user_input)
-    stock = yf.Ticker(yf_ticker)
-    df = stock.history(period="5y")
-    if df.empty or len(df) < 200: return None, None
+    ticker, candidates = get_yf_ticker_candidates(user_input)
+    
+    # 【盲測啟動】輪流測試 .TW 與 .TWO，直到抓到資料為止
+    df = pd.DataFrame()
+    yf_ticker = ""
+    stock = None
+    for cand in candidates:
+        stock = yf.Ticker(cand)
+        df = stock.history(period="5y")
+        if not df.empty and len(df) >= 10:
+            yf_ticker = cand
+            break # 成功抓到資料，跳出迴圈！
+            
+    if df.empty or len(df) < 10: 
+        return None, None
 
     try:
         info = stock.info
         pe_ratio = info.get('trailingPE', 0)
-        peg_ratio = info.get('pegRatio', 0)  # 取得 PEG Ratio
+        peg_ratio = info.get('pegRatio', 0)
         past_year_divs = stock.dividends[
             stock.dividends.index > (pd.Timestamp.now(tz=stock.dividends.index.tz) - pd.Timedelta(days=365))]
         total_div = past_year_divs.sum() if not past_year_divs.empty else 0
-        company_name = REVERSE_MAP.get(ticker, info.get('shortName', '未知名稱'))
+        company_name = STOCK_DB.get(ticker, {}).get("name", info.get('shortName', '未知名稱'))
         display_name = f"{company_name} ({ticker})"
     except:
-        pe_ratio = 0
-        peg_ratio = 0
-        total_div = 0
+        pe_ratio, peg_ratio, total_div = 0, 0, 0
         display_name = f"未知名稱 ({ticker})"
 
     current_price = df['Close'].iloc[-1]
-    prev_price = df['Close'].iloc[-2]
-    pct_change = ((current_price - prev_price) / prev_price) * 100
+    prev_price = df['Close'].iloc[-2] if len(df) > 1 else current_price
+    pct_change = ((current_price - prev_price) / prev_price) * 100 if prev_price > 0 else 0
     div_yield = (total_div / current_price) * 100 if current_price > 0 else 0
 
-    df[f'{short_ma}MA'] = df['Close'].rolling(window=short_ma).mean()
-    df[f'{long_ma}MA'] = df['Close'].rolling(window=long_ma).mean()
+    actual_short_ma = min(short_ma, len(df))
+    actual_long_ma = min(long_ma, len(df))
+    
+    df[f'{short_ma}MA'] = df['Close'].rolling(window=actual_short_ma).mean()
+    df[f'{long_ma}MA'] = df['Close'].rolling(window=actual_long_ma).mean()
 
     delta = df['Close'].diff()
-    rs = (delta.where(delta > 0, 0)).rolling(window=14).mean() / (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    window_length = min(14, len(df))
+    rs = (delta.where(delta > 0, 0)).rolling(window=window_length).mean() / (-delta.where(delta < 0, 0)).rolling(window=window_length).mean()
     df['RSI'] = 100 - (100 / (1 + rs))
 
     df_backtest = df.tail(backtest_days)
     horizon_days = int(target_months * 20)
 
-    if backtest_days <= horizon_days:
+    if len(df_backtest) <= horizon_days:
         prob_success, prob_loss = -1, -1
     else:
         valid_returns = df_backtest['Close'].pct_change(periods=horizon_days).dropna()
         prob_success = (valid_returns >= (target_return / 100)).mean() * 100 if not valid_returns.empty else 0
         prob_loss = (valid_returns < 0).mean() * 100 if not valid_returns.empty else 0
 
-    # 🌟 填息量化引擎 (計算近 3 年)
+    # 填息量化引擎
     df_raw = stock.history(period="3y", auto_adjust=False)
     divs = stock.dividends
     fill_rate, avg_fill_days, total_recent_divs = 0, 0, 0
@@ -159,22 +177,27 @@ def analyze_stock(user_input, target_months, target_return, short_ma, long_ma, b
             avg_fill_days = sum(days_to_fill) / len(days_to_fill) if days_to_fill else 0
 
     data_dict = {
-        "ticker": ticker, "display_name": display_name, "current_price": current_price, "pct_change": pct_change,
-        "pe_ratio": pe_ratio, "peg_ratio": peg_ratio, "div_yield": div_yield,  # 加入 peg_ratio
+        "ticker": ticker, "yf_ticker": yf_ticker, "display_name": display_name, "current_price": current_price, "pct_change": pct_change,
+        "pe_ratio": pe_ratio, "peg_ratio": peg_ratio, "div_yield": div_yield,
         f"{short_ma}MA": df[f'{short_ma}MA'].iloc[-1], f"{long_ma}MA": df[f'{long_ma}MA'].iloc[-1],
-        "RSI": df['RSI'].iloc[-1], "prob_success": prob_success, "prob_loss": prob_loss,
+        "RSI": df['RSI'].iloc[-1] if not pd.isna(df['RSI'].iloc[-1]) else 50, 
+        "prob_success": prob_success, "prob_loss": prob_loss,
         "fill_rate": fill_rate, "avg_fill_days": avg_fill_days, "total_divs": total_recent_divs
     }
     return data_dict, df
 
-
 def render_stock_card(data, df, short_ma, long_ma, backtest_days):
     st.header(f"📌 {data['display_name']}")
+    
+    # 🚨 上櫃/興櫃風險提醒
+    if ".TWO" in data.get("yf_ticker", ""):
+        st.warning("⚠️ **注意：此為上櫃/興櫃股票！** 流動性較低，股價波動風險較大，請謹慎評估。")
+        
     col1, col2, col3 = st.columns(3)
     col1.metric("最新收盤價", f"{data['current_price']:.2f}", f"{data['pct_change']:.2f}%")
 
     if data['prob_success'] == -1:
-        col2.metric("🎯 歷史達標率", "時間衝突", "請增加回測天數", delta_color="off")
+        col2.metric("🎯 歷史達標率", "資料不足", "無法回測長週期", delta_color="off")
     else:
         col2.metric(f"🎯 歷史達標率 ({backtest_days}天內)", f"{data['prob_success']:.2f}%")
 
@@ -195,7 +218,6 @@ def render_stock_card(data, df, short_ma, long_ma, backtest_days):
     fig.update_layout(height=300, margin=dict(l=0, r=0, t=10, b=0), xaxis_rangeslider_visible=False)
     st.plotly_chart(fig, use_container_width=True)
 
-    # 顯示估值指標
     stats_df = pd.DataFrame([{
         "本益比 (P/E)": f"{data['pe_ratio']:.2f}" if data['pe_ratio'] > 0 else "N/A",
         "本益成長比 (PEG)": f"{data['peg_ratio']:.2f}" if data['peg_ratio'] > 0 else "N/A",
@@ -204,19 +226,11 @@ def render_stock_card(data, df, short_ma, long_ma, backtest_days):
     }])
     st.dataframe(stats_df, hide_index=True)
 
-    # 提示 PEG 判斷標準
     if data['peg_ratio'] > 0:
         if data['peg_ratio'] < 1:
             st.success("✨ **估值偏低 (PEG < 1)：** 股價成長潛力大於目前估值，值得關注！")
         elif data['peg_ratio'] > 1.5:
             st.error("⚠️ **估值過高 (PEG > 1.5)：** 股價可能已經透支未來成長性，請留意追高風險！")
-
-
-def import_to_pk_callback(selected_names, names_list, codes_list):
-    st.session_state.t1 = st.session_state.t2 = st.session_state.t3 = st.session_state.t4 = ""
-    for i, selected_name in enumerate(selected_names):
-        idx = names_list.index(selected_name)
-        st.session_state[f"t{i + 1}"] = codes_list[idx]
 
 
 # ==========================================
@@ -231,10 +245,12 @@ if "prediction_result" not in st.session_state:
     st.session_state.prediction_result = ""
 if "predicted_tickers" not in st.session_state:
     st.session_state.predicted_tickers = []
+if "finance_data_str" not in st.session_state:
+    st.session_state.finance_data_str = ""
 
 for i in range(1, 5):
     if f't{i}' not in st.session_state:
-        st.session_state[f't{i}'] = "台積電" if i == 1 else ""
+        st.session_state[f't{i}'] = "3481" if i == 1 else "" # 預設改成3481給您測測看
 
 # ==========================================
 # 4. 網頁介面設計 (側邊欄)
@@ -284,17 +300,18 @@ with st.sidebar:
         show_logic_explanation()
 
 # ==========================================
-# 5. 主畫面：四大分頁設計
+# 5. 主畫面：五大分頁設計
 # ==========================================
-tab_pk, tab_health, tab_chat, tab_predict = st.tabs([
+tab_pk, tab_health, tab_chat, tab_predict, tab_finance = st.tabs([
     "⚔️ 1. PK 擂台",
     "📂 2. 體質健檢",
     "💬 3. 顧問對話室",
-    "🔮 4. 產業推演與潛力雷達"
+    "🔮 4. 產業推演與潛伏雷達",
+    "📑 5. 財報與法說會解析"
 ])
 
 # ----------------------------------------
-# 分頁 1: PK 對戰台 (含新聞輸入外掛)
+# 分頁 1: PK 對戰台
 # ----------------------------------------
 with tab_pk:
     if fetch_button:
@@ -304,12 +321,14 @@ with tab_pk:
         if not valid_tickers:
             st.error("要在左側至少輸入一檔股票名稱或代號，人家才能幫您算喔！")
         else:
-            with st.spinner("正在為 PK 名單抓取最新深度數據..."):
+            with st.spinner("正在啟動智慧盲測引擎，抓取最新深度數據..."):
                 results = []
                 for t in valid_tickers:
                     data, df = analyze_stock(t, target_months, target_return, short_ma, long_ma, backtest_days)
                     if data is not None:
                         results.append({"data": data, "df": df})
+                    else:
+                        st.error(f"⚠️ 找不到「{t}」的有效資料！連盲測引擎都失敗了，請確認這是一檔有交易紀錄的股票喔！")
                 st.session_state.stock_results = results
 
     results = st.session_state.stock_results
@@ -330,7 +349,6 @@ with tab_pk:
                         render_stock_card(results[i + 1]["data"], results[i + 1]["df"], short_ma, long_ma,
                                           backtest_days)
 
-        # 🌟 新增：獨家情報輸入區
         st.markdown("---")
         st.subheader("🗞️ 獨家情報與法說會查核 (選填)")
         user_news = st.text_area("貼上您看到的利多新聞、法說會大餅或小道消息，大師將化身「毒舌查核員」為您測謊：",
@@ -345,7 +363,6 @@ with tab_pk:
                         genai.configure(api_key=user_api_key)
                         model = genai.GenerativeModel('gemini-2.5-flash-lite')
 
-                        # 抓取今天真實的日期 (修復時空旅人 bug)
                         today_date = datetime.now().strftime("%Y年%m月%d日")
 
                         data_strings = []
@@ -402,7 +419,7 @@ with tab_health:
     st.download_button(label="📥 下載標準 CSV 測試範本檔", data=sample_csv_bytes, file_name="sample_trades.csv",
                        mime="text/csv")
 
-    uploaded_file = st.file_uploader("上傳您的 CSV 交易紀錄：", type=["csv"])
+    uploaded_file = st.file_uploader("上傳您的 CSV 交易紀錄：", type=["csv"], key="trade_csv")
     if uploaded_file is not None:
         try:
             df_trades = pd.read_csv(uploaded_file)
@@ -458,6 +475,7 @@ with tab_health:
 # ----------------------------------------
 with tab_chat:
     st.header("💬 AI 交易顧問對話室")
+
     chat_container = st.container(height=400)
     with chat_container:
         for msg in st.session_state.chat_messages:
@@ -465,7 +483,7 @@ with tab_chat:
 
     if prompt := st.chat_input("請問大師... (例如：請問現在台積電的法說會預期好嗎？)"):
         if not user_api_key:
-            st.error("🚨 記得先輸入 API Key 才能開啟對話喔！")
+            st.error("🚨 請先輸入 API Key 才能開啟對話喔！")
         else:
             st.chat_message("user").write(prompt)
             st.session_state.chat_messages.append({"role": "user", "content": prompt})
@@ -477,7 +495,6 @@ with tab_chat:
                     d = res["data"]
                     latest_data_context += f"- {d['display_name']}：最新收盤價 {d['current_price']:.2f}\n"
 
-            # 抓取今天真實的日期
             today_date = datetime.now().strftime("%Y年%m月%d日")
 
             system_context = f"""
@@ -509,7 +526,7 @@ with tab_chat:
                     st.error(f"連線失敗了。錯誤：{e}")
 
 # ----------------------------------------
-# 分頁 4: 產業推演與潛力雷達 (基本面雙軌判定)
+# 分頁 4: 產業推演與潛力雷達
 # ----------------------------------------
 with tab_predict:
     st.header("🔮 產業推演與潛力雷達 (基本面雙軌判定)")
@@ -529,8 +546,6 @@ with tab_predict:
                 try:
                     genai.configure(api_key=user_api_key)
                     model = genai.GenerativeModel('gemini-2.5-flash-lite')
-
-                    # 抓取今天真實的日期
                     today_date = datetime.now().strftime("%Y年%m月%d日")
 
                     predict_prompt = f"""
@@ -563,12 +578,10 @@ with tab_predict:
 
     if st.session_state.prediction_result:
         st.info(st.session_state.prediction_result)
-        st.success(
-            f"🤖 太棒了！系統已經從基本面報告中，為您鎖定 {len(st.session_state.predicted_tickers)} 檔潛力股代號：{st.session_state.predicted_tickers}")
+        st.success(f"🤖 太棒了！系統已經鎖定 {len(st.session_state.predicted_tickers)} 檔潛力股代號：{st.session_state.predicted_tickers}")
 
     st.markdown("---")
     st.subheader("第二步：基本面與技術面「雙軌判定」")
-    st.markdown("AI 挑出基本面好的股票後，我們讓 Python 來看看它現在的股價委屈到什麼程度，幫您決定該用什麼策略買進！")
 
     if st.button("📡 啟動雙軌策略判定雷達", type="primary"):
         target_tickers = st.session_state.predicted_tickers
@@ -576,18 +589,27 @@ with tab_predict:
             st.warning("⚠️ 麻煩您先執行上方的「AI 基本面推演」，讓系統有股票代號可以掃描喔！")
         else:
             scan_results = []
-            scan_bar = st.progress(0, text="正在為您融合基本面與技術面數據...")
+            scan_bar = st.progress(0, text="正在啟動盲測引擎，融合技術面數據...")
 
             for i, t in enumerate(target_tickers):
                 scan_bar.progress((i + 1) / len(target_tickers), text=f"正在幫您判定買點: {t}")
                 try:
-                    stock = yf.Ticker(f"{t}.TW")
-                    df_scan = stock.history(period="3mo")
+                    clean_ticker, candidates = get_yf_ticker_candidates(t)
+                    df_scan = pd.DataFrame()
+                    scan_yf_ticker = ""
+                    
+                    # 盲測引擎上線
+                    for cand in candidates:
+                        stock = yf.Ticker(cand)
+                        df_scan = stock.history(period="3mo")
+                        if len(df_scan) >= 30:
+                            scan_yf_ticker = cand
+                            break
+
                     if len(df_scan) < 30: continue
 
                     current_p = df_scan['Close'].iloc[-1]
                     ma_long_val = df_scan['Close'].rolling(long_ma).mean().iloc[-1]
-
                     bias_pct = ((current_p - ma_long_val) / ma_long_val) * 100
 
                     vol_5d_avg = df_scan['Volume'].tail(5).mean()
@@ -603,12 +625,11 @@ with tab_predict:
                     else:
                         status = "💤 默默吃貨中 (量縮打底，可分批佈局)"
 
-                    comp_name = REVERSE_MAP.get(t, stock.info.get('shortName', '未知名稱'))
+                    comp_name = REVERSE_MAP.get(clean_ticker, stock.info.get('shortName', '未知名稱'))
+                    if ".TWO" in scan_yf_ticker: comp_name += " (上/興櫃)"
 
                     scan_results.append({
-                        "代號": t,
-                        "公司名稱": comp_name,
-                        "收盤價": round(current_p, 2),
+                        "代號": clean_ticker, "公司名稱": comp_name, "收盤價": round(current_p, 2),
                         f"下緣均線({long_ma}MA)乖離(%)": round(bias_pct, 2),
                         "綜合策略判定 (基本面+技術面)": status
                     })
@@ -620,15 +641,107 @@ with tab_predict:
 
             if scan_results:
                 df_stealth = pd.DataFrame(scan_results)
-
                 st.write("📊 **雙軌策略判定報告：**")
                 st.dataframe(df_stealth.style.applymap(
-                    lambda x: 'background-color: #e6f7ff; color: #0050b3; font-weight: bold' if "嚴重低估" in str(
-                        x) else ('background-color: #ffcccc; color: black' if "籌碼進場" in str(x) else ''),
+                    lambda x: 'background-color: #e6f7ff; color: #0050b3; font-weight: bold' if "嚴重低估" in str(x) 
+                    else ('background-color: #ffcccc; color: black' if "籌碼進場" in str(x) else ''),
                     subset=['綜合策略判定 (基本面+技術面)']
                 ), hide_index=True, use_container_width=True)
-
-                st.markdown(
-                    f"> **💡 總司令解讀指南**：\n> * 如果看到藍色的 **「💎 嚴重低估 (適合左側建倉)」**，代表這檔股票雖然現在跌破均線沒人要，但 AI 已經幫您確認過它的財報跟訂單非常棒！您可以開始慢慢往下撿便宜囉！\n> * 如果看到紅色的 **「🚨 籌碼進場」**，代表基本面的好消息已經開始有人偷偷買單了，適合大膽進場！")
             else:
-                st.warning("查無符合條件的台股資料耶，要不要換個題材試試看？")
+                st.error("⚠️ 掃描完畢，但找不到這些代號的有效技術面資料。")
+
+# ----------------------------------------
+# 🌟 分頁 5: 財報與法說會深度解析
+# ----------------------------------------
+with tab_finance:
+    st.header("📑 財報與法說會深度解析")
+    st.markdown("將您的資源集中在最核心的「基本面」，讓 AI 為您剖析公司體質與未來展望！")
+
+    st.subheader("第一步：設定欲分析之目標公司")
+    col_t1, col_t2 = st.columns([1, 2])
+    with col_t1:
+        target_company = st.text_input("輸入股票代號或名稱：", value="2330")
+    
+    with col_t2:
+        st.write("")
+        st.write("")
+        if st.button("🌐 自動抓取最新財報關鍵數據"):
+            with st.spinner("啟動盲測引擎，前往資料庫撈取綜合損益與資產負債數據..."):
+                try:
+                    c_ticker, candidates = get_yf_ticker_candidates(target_company)
+                    
+                    q_fin = pd.DataFrame()
+                    c_yf_ticker = ""
+                    # 盲測引擎上線
+                    for cand in candidates:
+                        comp_stock = yf.Ticker(cand)
+                        q_fin = comp_stock.quarterly_financials
+                        if not q_fin.empty:
+                            c_yf_ticker = cand
+                            break
+
+                    if not q_fin.empty:
+                        fin_str = f"【股票代號 {c_yf_ticker} 近期財務重點數據】\n"
+                        fin_str += q_fin.head(10).to_string()
+                        st.session_state.finance_data_str = fin_str
+                        st.success(f"✅ 成功抓取 {target_company} 的近期財報數據！")
+                        with st.expander("👀 點擊預覽原始數據"):
+                            st.dataframe(q_fin.head(10))
+                    else:
+                        st.error(f"⚠️ 找不到「{target_company}」的財務數據！連盲測引擎都失敗了，請您直接在下方手動上傳財報喔！")
+                except Exception as e:
+                    st.error(f"抓取失敗：{e}")
+
+    st.markdown("---")
+    st.subheader("第二步：上傳法說會情報或財報分析 (選填)")
+    st.markdown("您可以上傳法說會的逐字稿、重點整理新聞，或您自己收集的 `.txt` / `.csv` 分析報告。")
+    uploaded_report = st.file_uploader("上傳補充分析檔案 (支援 .txt 或 .csv)：", type=["txt", "csv"], key="finance_report")
+    
+    report_text_content = ""
+    if uploaded_report is not None:
+        try:
+            report_text_content = uploaded_report.getvalue().decode("utf-8")
+            st.success("✅ 檔案讀取成功！")
+            with st.expander("👀 點擊預覽檔案內容"):
+                st.text(report_text_content[:500] + "...\n(以下省略)")
+        except Exception as e:
+            st.error(f"讀取檔案失敗：{e}")
+
+    st.markdown("---")
+    if st.button("🧠 啟動 AI 首席分析師進行深度評估", type="primary", use_container_width=True):
+        if not user_api_key:
+            st.error("🚨 記得先在左側輸入您的 API Key 喔！")
+        elif not st.session_state.finance_data_str and not report_text_content:
+            st.warning("⚠️ 您尚未抓取財報數據，也未上傳任何法說會情報。請至少完成其中一項再交給 AI 評估！")
+        else:
+            with st.spinner(f"【外資首席分析師】正在熬夜為您解讀 {target_company} 的財報與法說會內容..."):
+                try:
+                    genai.configure(api_key=user_api_key)
+                    model = genai.GenerativeModel('gemini-2.5-flash-lite')
+                    
+                    prompt = f"""
+                    你是頂級外資券商的首席分析師。
+                    請深度分析以下公司 ({target_company}) 的近期財務數據與法說會情報。
+                    
+                    【系統抓取的近期財報數據】：
+                    {st.session_state.finance_data_str if st.session_state.finance_data_str else "無提供"}
+                    
+                    【使用者上傳的法說會/補充資訊】：
+                    {report_text_content if report_text_content else "無提供"}
+                    
+                    請從以下幾個維度進行專業且易懂的解析：
+                    ### 📊 1. 獲利能力與體質檢查
+                    (分析毛利、營收趨勢、是否有潛在的財務風險或轉機)
+                    
+                    ### 🎤 2. 法說會/情報亮點與隱憂
+                    (針對使用者上傳的資訊，或是你所知曉的近期產業動態進行點評。戳破可能的大餅，指出真實的利多)
+                    
+                    ### 🎯 3. 綜合評等與操作策略
+                    (給出明確的基本面評等：強烈買進 / 買進 / 中立持有 / 減碼 / 賣出，並附上具體的操作建議)
+                    """
+                    
+                    response = model.generate_content(prompt)
+                    st.markdown(response.text)
+                    
+                except Exception as e:
+                    st.error(f"分析過程出現錯誤：{e}")
